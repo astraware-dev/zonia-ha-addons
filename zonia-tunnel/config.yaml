@@ -1,0 +1,22 @@
+name: Zonia Tunnel
+version: "1.0.0"
+slug: zonia_tunnel
+description: Acceso remoto seguro a este Home Assistant a través del servidor de Zonia (reemplaza a Nabu Casa).
+url: https://github.com/astraware-dev/zonia-ha-addons
+arch:
+  - aarch64
+  - amd64
+  - armv7
+init: false
+startup: services
+boot: auto
+options:
+  tenant_id: ""
+  token: ""
+  server: "35.253.76.219"
+  server_port: 7000
+schema:
+  tenant_id: "match(^[a-z0-9][a-z0-9_-]{1,62}$)"
+  token: password
+  server: str
+  server_port: port
