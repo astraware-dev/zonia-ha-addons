@@ -17,8 +17,14 @@ RUN set -eux; \
     mv "/tmp/frp_${FRP_VERSION}_linux_${arch}/frpc" /usr/bin/frpc; \
     rm -rf /tmp/frp_*
 
-# CA de Zonia: valida que el servidor de túneles es el nuestro.
+# Agente (Python): activación, publicación de sensores, config de HA.
+RUN apk add --no-cache python3 py3-pip \
+    && pip install --no-cache-dir --break-system-packages \
+       paho-mqtt==2.1.0 websocket-client==1.8.0
+
+# CA de Zonia: valida el servidor de túneles y el broker MQTT.
 COPY ca.crt /etc/zonia/ca.crt
+COPY agent.py /app/agent.py
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 

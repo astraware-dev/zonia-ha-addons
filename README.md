@@ -7,6 +7,6 @@ pegá `https://github.com/astraware-dev/zonia-ha-addons`.
 
 ## Add-ons
 
-- **[Zonia Tunnel](zonia-tunnel/DOCS.md)**: acceso remoto seguro a tu Home
-  Assistant a través del servidor de Zonia. Necesitás el `tenant_id` y el
-  `token` que te da Zonia.
+- **[Zonia](zonia-tunnel/DOCS.md)**: conecta la casa a Zonia con un código de
+  activación — monitoreo de energía + acceso remoto seguro
+  (`https://<id>.ha.zonia.co`), sin Nabu Casa ni configuración manual.

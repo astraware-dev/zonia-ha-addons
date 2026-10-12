@@ -1,19 +1,24 @@
-# Zonia Tunnel
+# Zonia
 
-Publica este Home Assistant en `https://<tenant_id>.<dominio de Zonia>`
-mediante un túnel saliente cifrado hacia el servidor de Zonia. No hace falta
-abrir puertos en el router y funciona detrás de CGNAT.
+Conecta esta casa a Zonia con un **código de activación**:
+
+- **Acceso remoto seguro** en `https://<tu-id>.ha.zonia.co` (túnel cifrado
+  saliente: no hace falta abrir puertos ni Nabu Casa).
+- **Monitoreo de energía**: publica los sensores de potencia, energía, voltaje
+  y corriente en la plataforma de Zonia.
 
 ## Configuración
 
-| Opción        | Valor                                   |
-|---------------|-----------------------------------------|
-| `tenant_id`   | el identificador de la casa (lo da Zonia) |
-| `token`       | el token del túnel (lo da Zonia)        |
-| `server`      | dejar por defecto                       |
-| `server_port` | dejar por defecto                       |
+1. Pegá en `activation_code` el código que te dio Zonia (ej. `4P13-95K8-TV5P`).
+2. Guardá, activá **Start on boot** y **Watchdog**, y dale **Start**.
 
-Además, en `configuration.yaml`:
+El código se usa una sola vez. Las credenciales quedan guardadas en el
+almacenamiento privado del add-on.
+
+## Qué cambia en tu Home Assistant
+
+Si `configuration.yaml` **no** tiene un bloque `http:`, el add-on agrega este
+bloque (necesario para el acceso remoto):
 
 ```yaml
 http:
@@ -25,5 +30,21 @@ http:
   login_attempts_threshold: 5
 ```
 
-y reiniciar Home Assistant. Recomendado: activar la verificación en dos pasos
-en el perfil de cada usuario de HA.
+Medidas de seguridad:
+
+- Antes de tocar nada guarda una copia: `configuration.yaml.zonia-backup-<fecha>`.
+- Valida la configuración (como "Comprobar configuración"). Si falla, deja el
+  archivo como estaba y **no** reinicia.
+- Reinicia Home Assistant una vez. Si no vuelve a levantar en 10 minutos,
+  restaura el archivo original y reinicia de nuevo.
+- Si ya existe un bloque `http:`, **no lo modifica**. En ese caso agregá a mano
+  las líneas de arriba que falten.
+
+También completa la "URL de Internet" de Home Assistant si estaba vacía.
+
+Recomendado: activá la verificación en dos pasos en el perfil de cada usuario.
+
+## Modo manual (instalaciones anteriores)
+
+Con `tenant_id` + `token` (sin código), el add-on solo abre el túnel de acceso
+remoto.

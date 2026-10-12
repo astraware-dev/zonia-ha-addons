@@ -1,7 +1,7 @@
-name: Zonia Tunnel
-version: "1.0.0"
+name: Zonia
+version: "2.0.0"
 slug: zonia_tunnel
-description: Acceso remoto seguro a este Home Assistant a través del servidor de Zonia (reemplaza a Nabu Casa).
+description: Conecta esta casa a Zonia (monitoreo de energía + acceso remoto seguro) con un código de activación.
 url: https://github.com/astraware-dev/zonia-ha-addons
 arch:
   - aarch64
@@ -10,13 +10,23 @@ arch:
 init: false
 startup: services
 boot: auto
+# Permisos (los mínimos para automatizar el alta):
+#  - homeassistant_api: leer los estados de los sensores (WebSocket de HA).
+#  - hassio_api + rol homeassistant: validar la configuración y reiniciar HA
+#    después de agregar el bloque http:, y limpiar el código ya usado.
+#  - homeassistant_config:rw: editar configuration.yaml (solo agrega el bloque
+#    http: si no existe, con backup y rollback).
+homeassistant_api: true
+hassio_api: true
+hassio_role: homeassistant
+map:
+  - homeassistant_config:rw
 options:
-  tenant_id: ""
-  token: ""
-  server: "35.253.76.219"
-  server_port: 7000
+  activation_code: ""
 schema:
-  tenant_id: "match(^[a-z0-9][a-z0-9_-]{1,62}$)"
-  token: password
-  server: str
-  server_port: port
+  activation_code: "str?"
+  # Modo manual/legado (altas hechas con manage-tunnel-user.sh): solo túnel.
+  tenant_id: "match(^[a-z0-9][a-z0-9_-]{1,62}$)?"
+  token: "password?"
+  server: "str?"
+  server_port: "port?"
