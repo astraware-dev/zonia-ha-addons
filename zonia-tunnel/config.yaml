@@ -1,5 +1,5 @@
 name: Zonia
-version: "2.0.0"
+version: "2.2.0"
 slug: zonia_tunnel
 description: Conecta esta casa a Zonia (monitoreo de energía + acceso remoto seguro) con un código de activación.
 url: https://github.com/astraware-dev/zonia-ha-addons
@@ -11,7 +11,8 @@ init: false
 startup: services
 boot: auto
 # Permisos (los mínimos para automatizar el alta):
-#  - homeassistant_api: leer los estados de los sensores (WebSocket de HA).
+#  - homeassistant_api: leer los estados de los sensores y los registros de
+#    dispositivos/entidades/áreas (WebSocket de HA, para el inventario).
 #  - hassio_api + rol homeassistant: validar la configuración y reiniciar HA
 #    después de agregar el bloque http:, y limpiar el código ya usado.
 #  - homeassistant_config:rw: editar configuration.yaml (solo agrega el bloque

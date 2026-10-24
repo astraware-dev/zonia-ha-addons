@@ -6,6 +6,13 @@ Conecta esta casa a Zonia con un **código de activación**:
   saliente: no hace falta abrir puertos ni Nabu Casa).
 - **Monitoreo de energía**: publica los sensores de potencia, energía, voltaje
   y corriente en la plataforma de Zonia.
+- **Inventario de equipos**: envía la lista de dispositivos de Home Assistant
+  que tienen sensores eléctricos (nombre, fabricante, modelo y área). Solo eso:
+  no envía otros dispositivos ni datos personales.
+- **Consumo por hora**: envía cuántos kWh registró cada sensor de energía por
+  hora, según las estadísticas de Home Assistant. Si se corta internet, al
+  volver completa las horas que faltaron. Solo funciona con sensores que tienen
+  `state_class` (los mismos que acepta el panel de Energía de HA).
 
 ## Configuración
 
