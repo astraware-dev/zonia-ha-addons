@@ -1,5 +1,5 @@
 name: Zonia
-version: "2.2.0"
+version: "2.3.0"
 slug: zonia_tunnel
 description: Conecta esta casa a Zonia (monitoreo de energía + acceso remoto seguro) con un código de activación.
 url: https://github.com/astraware-dev/zonia-ha-addons

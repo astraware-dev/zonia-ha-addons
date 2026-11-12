@@ -4,8 +4,11 @@ Conecta esta casa a Zonia con un **código de activación**:
 
 - **Acceso remoto seguro** en `https://<tu-id>.ha.zonia.co` (túnel cifrado
   saliente: no hace falta abrir puertos ni Nabu Casa).
-- **Monitoreo de energía**: publica los sensores de potencia, energía, voltaje
-  y corriente en la plataforma de Zonia.
+- **Monitoreo de energía**: publica solo los equipos que miden consumo (los que
+  reportan energía y además potencia, voltaje o corriente): su contador de
+  energía, la potencia y el voltaje. Potencia y voltaje se envían cuando cambian
+  de forma relevante (a lo sumo cada 5 s, y un refresco cada 5 min). Si en tu
+  HA no hay ningún equipo así, publica los sensores eléctricos por su nombre.
 - **Inventario de equipos**: envía la lista de dispositivos de Home Assistant
   que tienen sensores eléctricos (nombre, fabricante, modelo y área). Solo eso:
   no envía otros dispositivos ni datos personales.

@@ -5,8 +5,9 @@ conectada sin pasos manuales:
 
   1. Canjea el código → recibe sus credenciales (una sola vez; quedan en /data).
   2. Túnel de acceso remoto (frpc) → https://<tenant>.<dominio>.
-  3. Publica los sensores de energía al broker de Zonia por MQTT/TLS con el
-     MISMO formato de topics que `mqtt_statestream` (el backend no cambia).
+  3. Publica al broker de Zonia por MQTT/TLS (formato de `mqtt_statestream`)
+     SOLO lo de los equipos que miden consumo: su contador de energía, potencia
+     y voltaje. Potencia/voltaje con límite de frecuencia (ver Throttle).
   4. Agrega el bloque `http:` a configuration.yaml si no existe (con backup,
      validación y rollback automático) y reinicia HA.
   5. Reporta su estado al dashboard (heartbeat).
@@ -37,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 import paho.mqtt.client as mqtt
 import websocket
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 DATA_DIR = os.environ.get("ZONIA_DATA_DIR", "/data")
 OPTIONS_PATH = f"{DATA_DIR}/options.json"
 CREDS_PATH = f"{DATA_DIR}/credentials.json"
@@ -68,6 +69,123 @@ ATTRIBUTES = ("friendly_name", "unit_of_measurement", "device_class")
 ELECTRIC_CLASSES = ("power", "energy", "voltage", "current")
 ELECTRIC_UNITS = {"W": "power", "kW": "power", "Wh": "energy", "kWh": "energy",
                   "MWh": "energy", "V": "voltage", "A": "current", "mA": "current"}
+# ── Qué se publica por MQTT (desde 2.3.0) ──────────────────────
+# Para la factura importa UNA cosa por circuito: el contador de energía (kWh),
+# que el propio medidor acumula ("odómetro") — su consumo se toma de las
+# estadísticas de HA (sección 7), no de cada evento. Potencia y voltaje solo
+# sirven para la vista en vivo y las alertas. Todo lo demás no se publica.
+#
+# Equipo consumidor = dispositivo de HA con energía + potencia/voltaje/corriente
+# (misma regla que ha-monitor/shared/inventory.py). Los helpers/espejos no tienen
+# dispositivo y los sensores sueltos no son medidores → afuera.
+PUBLISHED_METRICS = ("energy", "power", "voltage")
+# Espeja ha-monitor/shared/classify.py (is_consumption_energy): energía exportada
+# y ventanas rodantes redundantes nunca cuentan como consumo.
+EXPORT_HINTS = ("export", "exportada", "exportado", "devuelta", "reintegr")
+REDUNDANT_WINDOW_HINTS = (
+    "energy_day", "energy_week", "energy_year",
+    "energia_dia", "energia_semana", "energia_anual", "energia_ano", "energia_anio",
+)
+
+# Límite de frecuencia para potencia/voltaje (la energía se publica siempre).
+DEADBAND = {"power": (10.0, 0.05), "voltage": (2.0, 0.0)}  # (absoluto, relativo)
+MIN_INTERVAL_S = 5      # entre publicaciones de un cambio relevante
+HEARTBEAT_S = 300       # aunque no cambie, refrescar el último valor
+FLUSH_EVERY_S = 2
+
+
+def is_consumption_energy_name(entity_id: str) -> bool:
+    name = entity_id.lower()
+    return not any(h in name for h in EXPORT_HINTS + REDUNDANT_WINDOW_HINTS)
+
+
+def select_published(electric: dict[str, dict], registry: dict[str, list]) -> set[str] | None:
+    """Entidades a publicar, o None si no hay ningún equipo consumidor (se cae
+    al filtro por nombre de siempre, igual que el backend sin inventario).
+
+    `electric`: entity_id → {"metric": energy|power|voltage|current, ...}.
+    `registry`: {"entity": [...]} de HA (para saber el dispositivo de cada una).
+    """
+    dev_of = {e.get("entity_id"): e.get("device_id") for e in registry.get("entity") or []}
+    by_dev: dict[str, dict[str, str]] = {}
+    for eid, info in electric.items():
+        dev = dev_of.get(eid)
+        if dev:
+            by_dev.setdefault(dev, {})[eid] = info["metric"]
+    out: set[str] = set()
+    for ents in by_dev.values():
+        metrics = set(ents.values())
+        if "energy" not in metrics or not metrics & {"power", "voltage", "current"}:
+            continue
+        for eid, metric in ents.items():
+            if metric not in PUBLISHED_METRICS:
+                continue
+            if metric == "energy" and not is_consumption_energy_name(eid):
+                continue
+            out.add(eid)
+    return out or None
+
+
+def _num(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+class Throttle:
+    """Decide cuándo publicar potencia/voltaje: al instante si cambió de verdad
+    (fuera de la banda muerta) o si se prende/apaga; a lo sumo cada
+    MIN_INTERVAL_S; y un refresco cada HEARTBEAT_S. Un cambio frenado por el
+    intervalo queda pendiente y lo publica `due()` — nunca se pierde el último
+    valor. La energía y los estados no numéricos pasan siempre que cambien."""
+
+    def __init__(self) -> None:
+        self.sent: dict[str, tuple[str, float]] = {}  # eid → (estado publicado, t)
+        self.pending: dict[str, dict] = {}            # eid → último state frenado
+
+    def check(self, eid: str, metric: str, st: dict, now: float) -> bool:
+        state = str(st.get("state"))
+        last = self.sent.get(eid)
+        if last is None:
+            return self._ok(eid, state, now)
+        last_state, last_t = last
+        if metric not in DEADBAND:
+            return self._ok(eid, state, now) if state != last_state else False
+        new, old = _num(state), _num(last_state)
+        if new is None or old is None:  # unavailable/unknown ↔ número
+            return self._ok(eid, state, now) if state != last_state else False
+        if metric == "power" and (new == 0) != (old == 0):
+            return self._ok(eid, state, now)  # se prendió / se apagó
+        abs_db, rel_db = DEADBAND[metric]
+        relevant = abs(new - old) >= max(abs_db, rel_db * abs(old))
+        if not relevant:
+            self.pending.pop(eid, None)  # volvió cerca de lo publicado
+            return self._ok(eid, state, now) if now - last_t >= HEARTBEAT_S else False
+        if now - last_t >= MIN_INTERVAL_S:
+            return self._ok(eid, state, now)
+        self.pending[eid] = st
+        return False
+
+    def due(self, now: float) -> list[dict]:
+        """States pendientes cuyo intervalo mínimo ya pasó (y los marca enviados)."""
+        out = []
+        for eid, st in list(self.pending.items()):
+            if now - self.sent.get(eid, ("", 0.0))[1] >= MIN_INTERVAL_S:
+                out.append(st)
+                self._ok(eid, str(st.get("state")), now)
+        return out
+
+    def _ok(self, eid: str, state: str, now: float) -> bool:
+        self.sent[eid] = (state, now)
+        self.pending.pop(eid, None)
+        return True
+
+    def forget(self, eid: str) -> None:
+        self.sent.pop(eid, None)
+        self.pending.pop(eid, None)
+
+
 REGISTRIES = ("device", "entity", "area")
 INVENTORY_QUIET_S = 10        # esperar a que HA deje de cambiar los registros
 INVENTORY_RESEND_S = 24 * 3600  # reenvío diario aunque no cambie (frescura)
@@ -91,6 +209,8 @@ http:
   login_attempts_threshold: 5
 # <<< zonia
 """
+
+PENDING = object()  # selección aún no calculada (faltan estados o registros)
 
 status = {"tunnel": "starting", "mqtt": "disabled", "sensors": 0, "http_config": "pending",
           "stats": "pending"}
@@ -256,6 +376,14 @@ class Publisher:
         self.inv_hash = ""
         self.inv_sent_at = 0.0
         self.inv_next_try = 0.0
+        # Qué se publica (ver select_published). PENDING hasta tener estados y
+        # registros; None = sin equipos consumidores → filtro por nombre.
+        self.selection: set[str] | None | object = PENDING
+        self.sel_dirty = True
+        self.last_state: dict[str, dict] = {}  # último state de cada candidata
+        self.cleared: set[str] = set()         # topics retenidos ya borrados
+        self.pub_lock = threading.Lock()
+        self.throttle = Throttle()
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                                   client_id=f"zonia-agent-{self.tenant}")
         self.client.username_pw_set(m["username"], m["password"])
@@ -279,14 +407,84 @@ class Publisher:
     def _on_disconnect(self, _c, _u, _f, reason, _p) -> None:
         status["mqtt"] = "disconnected"
 
+    # ── 3. publicación MQTT ──────────────────────────────────────
     def publish_state(self, st: dict | None) -> None:
-        if not st or not entity_matches(st.get("entity_id", "")):
+        if not st or not st.get("entity_id"):
             return
         eid = st["entity_id"]
-        self.entities.add(eid)
-        status["sensors"] = len(self.entities)
+        with self.lock:
+            if eid in self.electric or entity_matches(eid):
+                self.last_state[eid] = st
+            metric = (self.electric.get(eid) or {}).get("metric")
+        sel = self.reconcile()
+        if sel is PENDING or eid not in self._effective(sel):
+            return
+        with self.pub_lock:
+            if self.throttle.check(eid, metric or "other", st, time.time()):
+                self._mqtt_state(st)
+
+    def _effective(self, sel) -> set[str]:
+        """Conjunto publicado: la selección, o (sin equipos consumidores) lo que
+        pasa el filtro por nombre de siempre."""
+        if isinstance(sel, set):
+            return sel
+        with self.lock:
+            return {e for e in self.last_state if entity_matches(e)}
+
+    def reconcile(self):
+        """Recalcula la selección si cambiaron entidades/registros y aplica la
+        diferencia: publica lo que entra y borra los retenidos de lo que sale."""
+        with self.lock:
+            if not self.states_loaded or "entity" not in self.registry:
+                return PENDING
+            if not self.sel_dirty:
+                return self.selection
+            before = self.selection
+            self.selection = select_published(self.electric, self.registry)
+            self.sel_dirty = False
+            sel = self.selection
+            known = set(self.last_state)
+        if sel == before:
+            return sel
+        now_set = self._effective(sel)
+        old_set = self._effective(before) if before is not PENDING else known
+        with self.pub_lock:
+            for eid in sorted(old_set - now_set):
+                self._mqtt_clear(eid)
+                self.throttle.forget(eid)
+            for eid in sorted(now_set - old_set if before is not PENDING else now_set):
+                st = self.last_state.get(eid)
+                if st:
+                    metric = (self.electric.get(eid) or {}).get("metric") or "other"
+                    if self.throttle.check(eid, metric, st, time.time()):
+                        self._mqtt_state(st)
+        status["sensors"] = len(now_set)
+        if isinstance(sel, set):
+            log(f"Publicando {len(now_set)} entidades de consumo (energía, potencia y "
+                f"voltaje); {len(old_set - now_set)} dejan de publicarse.")
+        else:
+            log(f"Sin equipos consumidores en HA: publicando {len(now_set)} sensores por nombre.")
+        return sel
+
+    def flush_loop(self) -> None:
+        """Publica los cambios que el límite de frecuencia dejó pendientes."""
+        while True:
+            time.sleep(FLUSH_EVERY_S)
+            try:
+                with self.pub_lock:
+                    for st in self.throttle.due(time.time()):
+                        self._mqtt_state(st)
+            except Exception as exc:  # noqa: BLE001 - nunca matar el hilo
+                log(f"Aviso: error publicando pendientes ({exc}).")
+
+    def _base(self, eid: str) -> str:
         domain, obj = eid.split(".", 1)
-        base = f"tenant/{self.tenant}/homeassistant/{domain}/{obj}"
+        return f"tenant/{self.tenant}/homeassistant/{domain}/{obj}"
+
+    def _mqtt_state(self, st: dict) -> None:
+        eid = st["entity_id"]
+        base = self._base(eid)
+        self.cleared.discard(eid)
         self.client.publish(f"{base}/state", str(st.get("state")), qos=1, retain=True)
         attrs = st.get("attributes") or {}
         for k in ATTRIBUTES:
@@ -294,6 +492,17 @@ class Publisher:
             if v is not None and self.attr_cache.get((eid, k)) != v:
                 self.client.publish(f"{base}/{k}", json.dumps(v), qos=1, retain=True)
                 self.attr_cache[(eid, k)] = v
+
+    def _mqtt_clear(self, eid: str) -> None:
+        """Borra del broker los mensajes retenidos de una entidad que ya no se
+        publica (un payload vacío retenido los elimina; el backend lo ignora)."""
+        if eid in self.cleared:
+            return
+        base = self._base(eid)
+        for k in ("state", *ATTRIBUTES):
+            self.client.publish(f"{base}/{k}", b"", qos=1, retain=True)
+            self.attr_cache.pop((eid, k), None)
+        self.cleared.add(eid)
 
     def run_forever(self) -> None:
         while True:
@@ -323,6 +532,7 @@ class Publisher:
             self._mark_dirty()
 
     def _mark_dirty(self) -> None:
+        self.sel_dirty = True
         self.inv_dirty = True
         self.inv_changed_at = time.time()
 
@@ -364,19 +574,21 @@ class Publisher:
                 if msg.get("id") == 1 and msg.get("type") == "result":
                     with self.lock:
                         self.electric.clear()  # lo borrado mientras no estábamos, afuera
-                    for st in msg.get("result") or []:
-                        self.publish_state(st)
+                    states = msg.get("result") or []
+                    for st in states:
                         self.track(st.get("entity_id", ""), st)
                     with self.lock:
                         self.states_loaded = True
                         self._mark_dirty()
-                    log(f"Publicando {status['sensors']} sensores de energía.")
+                    for st in states:
+                        self.publish_state(st)
                 elif msg.get("type") == "result" and msg.get("id") in pending:
                     kind = pending.pop(msg["id"])
                     if msg.get("success"):
                         with self.lock:
                             self.registry[kind] = msg.get("result") or []
                             self._mark_dirty()
+                        self.reconcile()
                     else:
                         log(f"Aviso: no se pudo leer el registro de {kind} ({msg.get('error')}).")
                 elif msg.get("type") == "event":
@@ -386,8 +598,8 @@ class Publisher:
                         ask_registry(etype.removesuffix("_registry_updated"))
                         continue
                     data = ev.get("data") or {}
-                    self.publish_state(data.get("new_state"))
                     self.track(data.get("entity_id", ""), data.get("new_state"))
+                    self.publish_state(data.get("new_state"))
         finally:
             ws.close()
 
@@ -400,6 +612,8 @@ class Publisher:
         areas = {a.get("area_id"): a.get("name") for a in self.registry["area"]}
         devices = {d.get("id"): d for d in self.registry["device"]}
         entities = {e.get("entity_id"): e for e in self.registry["entity"]}
+        sel = self.selection
+        published = sel if isinstance(sel, set) else {e for e in self.electric if entity_matches(e)}
         equipos: dict[str, dict] = {}
         sin_equipo: list[dict] = []
         for eid, info in sorted(self.electric.items()):
@@ -411,7 +625,7 @@ class Publisher:
                 "unidad": info["unit"],
                 "nombre": info["name"],
                 "state_class": info["state_class"],
-                "publicada": entity_matches(eid),
+                "publicada": eid in published,
             }
             dev = devices.get(reg.get("device_id"))
             if not dev:
@@ -717,6 +931,7 @@ def main() -> None:
         threading.Thread(target=publisher.run_forever, daemon=True).start()
         threading.Thread(target=publisher.inventory_loop, daemon=True).start()
         threading.Thread(target=publisher.stats_loop, daemon=True).start()
+        threading.Thread(target=publisher.flush_loop, daemon=True).start()
         threading.Thread(target=heartbeat_loop, args=(creds, extra), daemon=True).start()
 
     status["http_config"] = ensure_http_config()
