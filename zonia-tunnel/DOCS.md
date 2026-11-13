@@ -20,7 +20,8 @@ Conecta esta casa a Zonia con un **código de activación**:
 ## Configuración
 
 1. Pegá en `activation_code` el código que te dio Zonia (ej. `4P13-95K8-TV5P`).
-2. Guardá, activá **Start on boot** y **Watchdog**, y dale **Start**.
+2. Guardá, activá **Start on boot** y dale **Start**. (**Watchdog** es opcional:
+   el agente ya se reinicia solo si se detiene.)
 
 El código se usa una sola vez. Las credenciales quedan guardadas en el
 almacenamiento privado del add-on.
@@ -53,6 +54,15 @@ Medidas de seguridad:
 También completa la "URL de Internet" de Home Assistant si estaba vacía.
 
 Recomendado: activá la verificación en dos pasos en el perfil de cada usuario.
+
+## Actualizaciones y cortes
+
+- Las actualizaciones se descargan ya compiladas: no se compila nada en tu
+  Home Assistant.
+- Si el agente se detiene, se vuelve a iniciar solo (en segundos; si sigue
+  fallando, espera cada vez más, hasta 5 minutos).
+- Si al activar no hay internet, sigue funcionando con la conexión anterior y
+  reintenta el código en segundo plano.
 
 ## Modo manual (instalaciones anteriores)
 
