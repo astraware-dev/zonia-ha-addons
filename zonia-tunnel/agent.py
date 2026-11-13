@@ -18,6 +18,11 @@ conectada sin pasos manuales:
      llegue cada evento por MQTT y recupera los huecos.
 
 Modo legado: sin código pero con tenant_id + token, solo hace el túnel (2).
+
+Robustez: el túnel ES el acceso remoto, así que nada puede tumbarlo. Si falla
+la activación por red se reintenta (y mientras tanto sigue el túnel anterior),
+los pasos de configuración de HA no pueden matar el proceso, y si el agente
+termina igual, run.sh lo vuelve a levantar.
 """
 from __future__ import annotations
 
@@ -28,7 +33,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -38,7 +45,7 @@ from datetime import datetime, timedelta, timezone
 import paho.mqtt.client as mqtt
 import websocket
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 DATA_DIR = os.environ.get("ZONIA_DATA_DIR", "/data")
 OPTIONS_PATH = f"{DATA_DIR}/options.json"
 CREDS_PATH = f"{DATA_DIR}/credentials.json"
@@ -260,26 +267,10 @@ def supervisor(method: str, path: str, body: dict | None = None, timeout: int = 
 
 
 # ── 1. credenciales ──────────────────────────────────────────────
-def load_credentials(opts: dict) -> dict:
-    creds = read_json(CREDS_PATH)
-    code = (opts.get("activation_code") or "").strip()
-    code_sha = hashlib.sha256(code.upper().encode()).hexdigest() if code else ""
-
-    if code and code_sha != creds.get("code_sha"):
-        log("Canjeando código de activación…")
-        st, resp = http_json("POST", f"{FUNCTIONS_BASE}/activate", {"code": code})
-        if st != 200:
-            raise SystemExit(f"Activación rechazada ({st}): {resp.get('error', 'error desconocido')}")
-        creds = {**resp, "code_sha": code_sha, "source": "activation"}
-        write_json_private(CREDS_PATH, creds)
-        log(f"Activado como '{creds['tenant_id']}'.")
-        clear_activation_code(opts)
-        return creds
-
+def previous_credentials(opts: dict, creds: dict) -> dict | None:
+    """Credenciales con las que ya funcionaba (activación anterior o modo legado)."""
     if creds.get("tenant_id"):
         return creds
-
-    # Modo legado (alta manual): solo túnel.
     if opts.get("tenant_id") and opts.get("token"):
         return {
             "tenant_id": opts["tenant_id"],
@@ -288,6 +279,82 @@ def load_credentials(opts: dict) -> dict:
                        "token": opts["token"]},
             "source": "manual",
         }
+    return None
+
+
+def redeem(code: str) -> tuple[int, dict]:
+    """Canjea el código. st=0 si no hubo respuesta (sin internet, DNS, timeout)."""
+    try:
+        return http_json("POST", f"{FUNCTIONS_BASE}/activate", {"code": code})
+    except (OSError, ValueError) as exc:
+        return 0, {"error": f"sin conexión ({exc})"}
+
+
+def save_activation(opts: dict, resp: dict, code_sha: str) -> dict:
+    creds = {**resp, "code_sha": code_sha, "source": "activation"}
+    write_json_private(CREDS_PATH, creds)
+    log(f"Activado como '{creds['tenant_id']}'.")
+    try:
+        clear_activation_code(opts)
+    except Exception as exc:  # noqa: BLE001 - opcional
+        log(f"Aviso: no se pudo limpiar el código de las opciones ({exc}).")
+    return creds
+
+
+def activation_retry_loop(opts: dict, code: str, code_sha: str) -> None:
+    """Reintenta el canje en segundo plano mientras sigue el túnel anterior.
+    Al lograrlo guarda las credenciales y reinicia el agente (run.sh lo levanta
+    de nuevo en segundos, ya con las credenciales nuevas)."""
+    delay = 30
+    while True:
+        time.sleep(delay)
+        st, resp = redeem(code)
+        if st == 200 and resp.get("tenant_id"):
+            save_activation(opts, resp, code_sha)
+            log("Reiniciando el agente con las credenciales nuevas…")
+            stop_tunnel()
+            os._exit(0)
+        if 400 <= st < 500:
+            log(f"Activación rechazada ({st}): {resp.get('error', 'error desconocido')}. "
+                "Sigo con la conexión anterior.")
+            return
+        delay = min(delay * 2, 600)
+        log(f"Aún no se pudo canjear el código ({resp.get('error') or st}); reintento en {delay} s.")
+
+
+def load_credentials(opts: dict) -> dict:
+    creds = read_json(CREDS_PATH)
+    code = (opts.get("activation_code") or "").strip()
+    code_sha = hashlib.sha256(code.upper().encode()).hexdigest() if code else ""
+    previous = previous_credentials(opts, creds)
+
+    if code and code_sha != creds.get("code_sha"):
+        delay = 15
+        while True:
+            log("Canjeando código de activación…")
+            st, resp = redeem(code)
+            if st == 200 and resp.get("tenant_id"):
+                return save_activation(opts, resp, code_sha)
+            err = resp.get("error") or "error desconocido"
+            if 400 <= st < 500:
+                # Código inválido/usado/vencido: no tiene sentido reintentar.
+                if previous:
+                    log(f"Activación rechazada ({st}): {err}. Sigo con la conexión anterior.")
+                    return previous
+                raise SystemExit(f"Activación rechazada ({st}): {err}")
+            # Sin internet o error del servidor: reintentar sin perder el túnel.
+            if previous:
+                log(f"No se pudo canjear el código ({err if st == 0 else st}). Sigo con la "
+                    "conexión anterior y reintento en segundo plano.")
+                threading.Thread(target=activation_retry_loop, args=(opts, code, code_sha),
+                                 daemon=True).start()
+                return previous
+            log(f"No se pudo canjear el código ({err if st == 0 else st}); reintento en {delay} s.")
+            time.sleep(delay)
+            delay = min(delay * 2, 300)
+
+    if previous:
+        return previous
     raise SystemExit("Falta el código de activación: pegalo en la pestaña Configuración y reiniciá el add-on.")
 
 
@@ -330,10 +397,37 @@ subdomain = "{tenant}"
         f.write(conf)
 
 
+tunnel_proc: subprocess.Popen | None = None
+
+
+def stop_tunnel() -> None:
+    """Cierra frpc. Si no, al reiniciarse el agente quedarían dos túneles."""
+    proc = tunnel_proc
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def kill_stray_frpc() -> None:
+    """Un frpc huérfano de una ejecución anterior (si el agente murió de golpe)."""
+    subprocess.run(["pkill", "-x", "frpc"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def run_tunnel() -> None:
+    global tunnel_proc
     while True:
-        proc = subprocess.Popen(["frpc", "-c", FRPC_CONF], stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+        try:
+            proc = subprocess.Popen(["frpc", "-c", FRPC_CONF], stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+        except OSError as exc:
+            log(f"No se pudo iniciar el túnel ({exc}); reintento en 10 s…")
+            time.sleep(10)
+            continue
+        tunnel_proc = proc
         for line in proc.stdout:  # type: ignore[union-attr]
             line = re.sub(r"\x1b\[[0-9;]*m", "", line).rstrip()
             print(f"[túnel] {line}", flush=True)
@@ -912,16 +1006,27 @@ def heartbeat_loop(creds: dict, extra: dict) -> None:
                 "version": VERSION, **status, **extra}
         try:
             http_json("POST", f"{FUNCTIONS_BASE}/agentStatus", body, timeout=20)
-        except OSError:
+        except Exception:  # noqa: BLE001 - el heartbeat nunca debe matar nada
             pass
         time.sleep(300)
 
 
-def main() -> None:
+def safe_step(name: str, fn, *args) -> str:
+    """Pasos opcionales de configuración de HA: un error se registra, no tumba
+    el agente (y con él el túnel)."""
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001
+        log(f"Aviso: falló {name} ({exc!r}); el túnel y el monitoreo siguen.")
+        return f"error: {exc!r}"[:200]
+
+
+def run() -> None:
     opts = read_json(OPTIONS_PATH)
     creds = load_credentials(opts)
     log(f"Zonia {VERSION} — cliente '{creds['tenant_id']}'")
 
+    kill_stray_frpc()
     write_frpc_conf(creds, opts)
     threading.Thread(target=run_tunnel, daemon=True).start()
 
@@ -934,12 +1039,21 @@ def main() -> None:
         threading.Thread(target=publisher.flush_loop, daemon=True).start()
         threading.Thread(target=heartbeat_loop, args=(creds, extra), daemon=True).start()
 
-    status["http_config"] = ensure_http_config()
+    status["http_config"] = safe_step("la configuración de http:", ensure_http_config)
     extra["http_detail"] = status["http_config"]
-    extra["external_url"] = ensure_external_url(creds.get("url"))
+    extra["external_url"] = safe_step("la URL de Internet", ensure_external_url, creds.get("url"))
 
     while True:
         time.sleep(3600)
+
+
+def main() -> None:
+    # El Supervisor detiene el add-on con SIGTERM: salir limpio (cerrando frpc).
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        run()
+    finally:
+        stop_tunnel()
 
 
 if __name__ == "__main__":

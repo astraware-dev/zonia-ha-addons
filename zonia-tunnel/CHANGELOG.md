@@ -1,5 +1,15 @@
 # Registro de cambios
 
+## 2.4.0 — 2026-11-13
+
+- La actualización ya no se compila en tu Home Assistant: se descarga lista.
+  Es mucho más rápida y no deja la casa sin acceso remoto por varios minutos.
+- Si el agente se detiene por cualquier motivo, se vuelve a iniciar solo.
+- Si al activar no hay internet, sigue funcionando con la conexión anterior y
+  reintenta el código en segundo plano.
+- Un error al ajustar la configuración de Home Assistant ya no corta el acceso
+  remoto.
+
 ## 2.3.0 — 2026-11-11
 
 - Solo se publican los equipos que miden consumo (los que reportan energía y

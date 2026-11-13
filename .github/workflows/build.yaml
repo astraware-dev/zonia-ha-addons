@@ -1,0 +1,76 @@
+# Compila la imagen del add-on para cada arquitectura y la publica en GHCR.
+# Así Home Assistant DESCARGA la imagen al actualizar, en vez de compilarla en
+# la casa (que tarda minutos en una Raspberry y deja la casa sin túnel mientras
+# tanto, o falla si se corta internet a la mitad).
+#
+# OJO, orden de publicación: config.yaml tiene `image:`, así que una versión
+# nueva solo debe llegar a `main` cuando su imagen ya existe. Flujo:
+#   1. push a una rama (ej. release/2.4.0) → esta acción compila y publica.
+#   2. verificar que terminó en verde (y que los paquetes de GHCR son públicos).
+#   3. merge a main → Home Assistant ve la actualización.
+name: Compilar add-on
+
+on:
+  push:
+    paths:
+      - "zonia-tunnel/**"
+      - ".github/workflows/build.yaml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            platform: linux/arm64
+          - arch: amd64
+            platform: linux/amd64
+          - arch: armv7
+            platform: linux/arm/v7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Leer versión y base
+        id: meta
+        run: |
+          version=$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' zonia-tunnel/config.yaml)
+          base=$(sed -n "s/^ *${{ matrix.arch }}: *//p" zonia-tunnel/build.yaml)
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          test -n "$version" && test -n "$base"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/${{ matrix.arch }}-addon-zonia_tunnel" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: zonia-tunnel
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          push: true
+          build-args: |
+            BUILD_FROM=${{ steps.meta.outputs.base }}
+            BUILD_ARCH=${{ matrix.arch }}
+          labels: |
+            io.hass.type=addon
+            io.hass.name=Zonia
+            io.hass.arch=${{ matrix.arch }}
+            io.hass.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
